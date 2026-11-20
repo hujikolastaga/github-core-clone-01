@@ -1,0 +1,9 @@
+{
+  "name": "github-core-clone-01",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
