@@ -1,0 +1,18 @@
+[package]
+name = "forge"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+itoa = "1.0.18"
+memchr = "2.8.0"
+rustc-hash = "2.1.2"
+serde_json = "1.0.150"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

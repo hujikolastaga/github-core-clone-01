@@ -1,99 +1,66 @@
-import type { AddressInfo } from 'node:net';
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { chmodSync, copyFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const here = dirname(fileURLToPath(import.meta.url));
+let activeChild: ChildProcess | null = null;
+let exiting = false;
 
-async function registerWithEnv(envUrl: string, port: number): Promise<void> {
-  const registerUrl = `${envUrl.replace(/\/+$/, '')}/register`;
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      const resp = await fetch(registerUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-      });
-      if (resp.ok) return;
-      lastError = new Error(`register returned HTTP ${resp.status}`);
-    } catch (err) {
-      lastError = err;
-    }
-    await delay(Math.min(200, 25 + attempt * 15));
+function shutdown(sig: NodeJS.Signals): void {
+  exiting = true;
+  if (activeChild && !activeChild.killed) {
+    activeChild.kill(sig);
   }
-  throw lastError instanceof Error ? lastError : new Error('Failed to register port with runner');
 }
 
-async function waitUntilDone(envUrl: string, signal: AbortSignal): Promise<void> {
-  const doneUrl = `${envUrl.replace(/\/+$/, '')}/done`;
-  while (!signal.aborted) {
-    try {
-      const resp = await fetch(doneUrl, { signal });
-      if (resp.ok) {
-        const data = (await resp.json()) as { done?: boolean };
-        if (data.done === true) return;
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+
+function launch(binPath: string, allowTmpFallback: boolean): void {
+  const child = spawn(binPath, {
+    stdio: 'inherit',
+    env: process.env,
+  });
+  activeChild = child;
+
+  child.once('error', (err: NodeJS.ErrnoException) => {
+    if (
+      allowTmpFallback &&
+      (err.code === 'EACCES' || err.code === 'ENOEXEC' || err.code === 'EPERM')
+    ) {
+      try {
+        const tmpBin = '/tmp/forge-linux-amd64';
+        copyFileSync(binPath, tmpBin);
+        chmodSync(tmpBin, 0o755);
+        launch(tmpBin, false);
+        return;
+      } catch (copyErr) {
+        process.stderr.write(`Failed fallback launch: ${String(copyErr)}\n`);
       }
-    } catch {
-      if (signal.aborted) return;
-    }
-    await delay(100);
-  }
-}
-
-async function main(): Promise<void> {
-  const envUrl = process.env.MAKEFUN_ENV_URL;
-  const devPortRaw = process.env.MAKEFUN_DEV_PORT;
-
-  if (!envUrl && devPortRaw === undefined) {
-    process.stderr.write('MAKEFUN_ENV_URL is required\n');
-    process.exit(1);
-  }
-
-  const { server } = createApp();
-  const listenPort = !envUrl && devPortRaw !== undefined ? Number(devPortRaw) : 0;
-
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    if (!envUrl && devPortRaw !== undefined) {
-      server.listen(listenPort, '127.0.0.1', () => {
-        server.off('error', reject);
-        resolve();
-      });
     } else {
-      server.listen(0, () => {
-        server.off('error', reject);
-        resolve();
-      });
+      process.stderr.write(`Failed to launch ${binPath}: ${err.message}\n`);
     }
+    process.exit(1);
   });
 
-  const addr = server.address() as AddressInfo;
-  if (!addr || typeof addr.port !== 'number') {
-    process.stderr.write('Failed to obtain bound server port\n');
-    process.exit(1);
-  }
-
-  const ac = new AbortController();
-  const shutdown = (): void => {
-    ac.abort();
-    server.close(() => process.exit(0));
-  };
-  process.once('SIGTERM', shutdown);
-  process.once('SIGINT', shutdown);
-
-  if (!envUrl) {
-    process.stdout.write(`listening on http://127.0.0.1:${addr.port}\n`);
-    return;
-  }
-
-  await registerWithEnv(envUrl, addr.port);
-  await waitUntilDone(envUrl, ac.signal);
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  process.exit(0);
+  child.once('exit', (code, signal) => {
+    if (exiting || code !== null) {
+      process.exit(code ?? 0);
+    }
+    if (signal) {
+      process.exit(1);
+    }
+    process.exit(0);
+  });
 }
 
-main().catch((err) => {
-  process.stderr.write(`${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
-  process.exit(1);
-});
+if (process.platform === 'win32') {
+  const altWin = join(here, 'forge-win-local.exe');
+  const winExe = existsSync(altWin)
+    ? altWin
+    : process.env.MAKEFUN_WIN_FORGE_EXE || join(here, 'target', 'release', 'forge.exe');
+  launch(winExe, false);
+} else {
+  launch(join(here, 'forge-linux-amd64'), true);
+}
