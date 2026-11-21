@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 
 use crate::git_http::{try_handle_git_http, GitResponse};
@@ -12,9 +12,9 @@ use crate::pack::PackDecoder;
 use crate::rest::{handle_rest_api, not_found_http, RestResponse};
 use crate::store::{base64_decode_lenient, build_http_response, ForgeStore};
 
-const WORKER_COUNT: usize = 64;
-const MAX_TOTAL_WORKERS: usize = 160;
-const WORKER_STACK_BYTES: usize = 512 * 1024;
+const WORKER_COUNT: usize = 128;
+const MAX_TOTAL_WORKERS: usize = 200;
+const WORKER_STACK_BYTES: usize = 256 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const HEALTHZ_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n{\"ok\":true}";
 const HEALTHZ_HEAD_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n";
@@ -25,6 +25,21 @@ struct QueueState {
     shutdown: bool,
 }
 
+#[derive(Clone)]
+struct GlobalRawEntry {
+    epoch: u64,
+    raw_req: Vec<u8>,
+    target: Vec<u8>,
+    resp: L1Bytes,
+    is_v2: bool,
+}
+
+struct GlobalGitL2 {
+    get_slot: Option<GlobalRawEntry>,
+    post_slots: [Option<GlobalRawEntry>; 2],
+    post_next: usize,
+}
+
 pub struct AppContext {
     pub store: ForgeStore,
     pub expected_token: String,
@@ -33,6 +48,7 @@ pub struct AppContext {
     pub err_auth_git_http: Vec<u8>,
     queue: Mutex<QueueState>,
     cv: Condvar,
+    global_git_l2: RwLock<GlobalGitL2>,
     total_workers: AtomicUsize,
     shutdown_flag: AtomicBool,
 }
@@ -70,6 +86,11 @@ impl AppContext {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            global_git_l2: RwLock::new(GlobalGitL2 {
+                get_slot: None,
+                post_slots: [None, None],
+                post_next: 0,
+            }),
             total_workers: AtomicUsize::new(0),
             shutdown_flag: AtomicBool::new(false),
         })
@@ -195,7 +216,7 @@ impl WorkerL1Cache {
 
 fn worker_loop(ctx: Arc<AppContext>) {
     let mut decoder = PackDecoder::new();
-    let mut read_buf = vec![0u8; 16 * 1024];
+    let mut read_buf = vec![0u8; 8 * 1024];
     let mut chunk_buf = Vec::with_capacity(4096);
     let mut body_scratch = Vec::with_capacity(2048);
     let mut write_buf = Vec::with_capacity(8192);
@@ -233,7 +254,7 @@ fn worker_loop(ctx: Arc<AppContext>) {
 
 fn overflow_conn_run(ctx: &Arc<AppContext>, stream: TcpStream) {
     let mut decoder = PackDecoder::new();
-    let mut read_buf = vec![0u8; 16 * 1024];
+    let mut read_buf = vec![0u8; 8 * 1024];
     let mut chunk_buf = Vec::with_capacity(4096);
     let mut body_scratch = Vec::with_capacity(2048);
     let mut write_buf = Vec::with_capacity(8192);
@@ -326,18 +347,49 @@ fn handle_connection(
                 Ok(n) => {
                     filled = n;
                     if n <= 4096 {
-                        if read_buf[0] == b'G'
-                            && n == l1.raw_get_req.len()
-                            && &read_buf[..n] == l1.raw_get_req.as_slice()
-                        {
-                            if let Some(resp) = &l1.get_resp {
-                                let cur_epoch = if l1.get_is_git {
-                                    ctx.store.git_epoch.load(Ordering::Acquire)
-                                } else {
-                                    ctx.store.read_epoch.load(Ordering::Acquire)
+                        if read_buf[0] == b'G' {
+                            if n == l1.raw_get_req.len()
+                                && &read_buf[..n] == l1.raw_get_req.as_slice()
+                            {
+                                if let Some(resp) = &l1.get_resp {
+                                    let cur_epoch = if l1.get_is_git {
+                                        ctx.store.git_epoch.load(Ordering::Acquire)
+                                    } else {
+                                        ctx.store.read_epoch.load(Ordering::Acquire)
+                                    };
+                                    if cur_epoch == l1.get_epoch {
+                                        if stream.write_all(resp.as_slice()).is_err() {
+                                            return;
+                                        }
+                                        filled = 0;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                let cur_git_epoch = ctx.store.git_epoch.load(Ordering::Acquire);
+                                let l2_hit = {
+                                    let l2 = ctx.global_git_l2.read().unwrap();
+                                    match &l2.get_slot {
+                                        Some(e)
+                                            if e.epoch == cur_git_epoch
+                                                && n == e.raw_req.len()
+                                                && &read_buf[..n] == e.raw_req.as_slice() =>
+                                        {
+                                            Some(e.clone())
+                                        }
+                                        _ => None,
+                                    }
                                 };
-                                if cur_epoch == l1.get_epoch {
-                                    if stream.write_all(resp.as_slice()).is_err() {
+                                if let Some(entry) = l2_hit {
+                                    l1.get_epoch = entry.epoch;
+                                    l1.get_is_git = true;
+                                    l1.get_is_v2 = entry.is_v2;
+                                    l1.get_path.clear();
+                                    l1.get_path.extend_from_slice(&entry.target);
+                                    l1.raw_get_req.clear();
+                                    l1.raw_get_req.extend_from_slice(&entry.raw_req);
+                                    l1.get_resp = Some(entry.resp.clone());
+                                    if stream.write_all(entry.resp.as_slice()).is_err() {
                                         return;
                                     }
                                     filled = 0;
@@ -360,6 +412,35 @@ fn handle_connection(
                             }
                             if let Some(bytes) = hit_raw {
                                 if stream.write_all(bytes).is_err() {
+                                    return;
+                                }
+                                filled = 0;
+                                continue;
+                            }
+                            let l2_hit = {
+                                let l2 = ctx.global_git_l2.read().unwrap();
+                                l2.post_slots
+                                    .iter()
+                                    .flatten()
+                                    .find(|e| {
+                                        e.epoch == cur_git_epoch
+                                            && n == e.raw_req.len()
+                                            && &read_buf[..n] == e.raw_req.as_slice()
+                                    })
+                                    .cloned()
+                            };
+                            if let Some(entry) = l2_hit {
+                                let idx = l1.git_post_next;
+                                l1.git_post_next = (idx + 1) & 1;
+                                let slot = &mut l1.git_post[idx];
+                                slot.epoch = entry.epoch;
+                                slot.target.clear();
+                                slot.target.extend_from_slice(&entry.target);
+                                slot.body.clear();
+                                slot.raw_req.clear();
+                                slot.raw_req.extend_from_slice(&entry.raw_req);
+                                slot.resp = Some(entry.resp.clone());
+                                if stream.write_all(entry.resp.as_slice()).is_err() {
                                     return;
                                 }
                                 filled = 0;
@@ -657,6 +738,7 @@ fn handle_connection(
                 let mut hit_slice: Option<&[u8]> = None;
                 for slot in &l1.git_post {
                     if slot.epoch == cur_git_epoch
+                        && !slot.body.is_empty()
                         && slot.target.as_slice() == target_b
                         && slot.body.as_slice() == body_slice_l1
                     {
@@ -788,15 +870,31 @@ fn handle_connection(
                     match git_res {
                         GitResponse::Static(slice) => {
                             if method_b == b"GET" {
-                                l1.get_epoch = ctx.store.git_epoch.load(Ordering::Acquire);
+                                let ep = ctx.store.git_epoch.load(Ordering::Acquire);
+                                l1.get_epoch = ep;
                                 l1.get_is_git = true;
                                 l1.get_is_v2 = req_is_v2;
                                 l1.get_path.clear();
                                 l1.get_path.extend_from_slice(target_b);
                                 l1.get_resp = Some(L1Bytes::Static(slice));
                                 if cache_raw {
+                                    let raw = &read_buf[..total_consumed];
                                     l1.raw_get_req.clear();
-                                    l1.raw_get_req.extend_from_slice(&read_buf[..total_consumed]);
+                                    l1.raw_get_req.extend_from_slice(raw);
+                                    let already = {
+                                        let l2 = ctx.global_git_l2.read().unwrap();
+                                        matches!(&l2.get_slot, Some(e) if e.epoch == ep && e.raw_req.as_slice() == raw)
+                                    };
+                                    if !already {
+                                        let mut l2 = ctx.global_git_l2.write().unwrap();
+                                        l2.get_slot = Some(GlobalRawEntry {
+                                            epoch: ep,
+                                            raw_req: raw.to_vec(),
+                                            target: target_b.to_vec(),
+                                            resp: L1Bytes::Static(slice),
+                                            is_v2: req_is_v2,
+                                        });
+                                    }
                                 } else {
                                     l1.raw_get_req.clear();
                                 }
@@ -807,31 +905,68 @@ fn handle_connection(
                         }
                         GitResponse::Cached(arc) => {
                             if method_b == b"GET" {
-                                l1.get_epoch = ctx.store.git_epoch.load(Ordering::Acquire);
+                                let ep = ctx.store.git_epoch.load(Ordering::Acquire);
+                                l1.get_epoch = ep;
                                 l1.get_is_git = true;
                                 l1.get_is_v2 = req_is_v2;
                                 l1.get_path.clear();
                                 l1.get_path.extend_from_slice(target_b);
                                 l1.get_resp = Some(L1Bytes::Arc(arc.clone()));
                                 if cache_raw {
+                                    let raw = &read_buf[..total_consumed];
                                     l1.raw_get_req.clear();
-                                    l1.raw_get_req.extend_from_slice(&read_buf[..total_consumed]);
+                                    l1.raw_get_req.extend_from_slice(raw);
+                                    let already = {
+                                        let l2 = ctx.global_git_l2.read().unwrap();
+                                        matches!(&l2.get_slot, Some(e) if e.epoch == ep && e.raw_req.as_slice() == raw)
+                                    };
+                                    if !already {
+                                        let mut l2 = ctx.global_git_l2.write().unwrap();
+                                        l2.get_slot = Some(GlobalRawEntry {
+                                            epoch: ep,
+                                            raw_req: raw.to_vec(),
+                                            target: target_b.to_vec(),
+                                            resp: L1Bytes::Arc(arc.clone()),
+                                            is_v2: req_is_v2,
+                                        });
+                                    }
                                 } else {
                                     l1.raw_get_req.clear();
                                 }
                             } else if method_b == b"POST" && target_b.ends_with(b"/git-upload-pack") {
+                                let ep = ctx.store.git_epoch.load(Ordering::Acquire);
                                 let idx = l1.git_post_next;
                                 l1.git_post_next = (idx + 1) & 1;
                                 let slot = &mut l1.git_post[idx];
-                                slot.epoch = ctx.store.git_epoch.load(Ordering::Acquire);
+                                slot.epoch = ep;
                                 slot.target.clear();
                                 slot.target.extend_from_slice(target_b);
                                 slot.body.clear();
                                 slot.body.extend_from_slice(body_slice);
                                 slot.resp = Some(L1Bytes::Arc(arc.clone()));
                                 if cache_raw {
+                                    let raw = &read_buf[..total_consumed];
                                     slot.raw_req.clear();
-                                    slot.raw_req.extend_from_slice(&read_buf[..total_consumed]);
+                                    slot.raw_req.extend_from_slice(raw);
+                                    let already = {
+                                        let l2 = ctx.global_git_l2.read().unwrap();
+                                        l2.post_slots
+                                            .iter()
+                                            .flatten()
+                                            .any(|e| e.epoch == ep && e.raw_req.as_slice() == raw)
+                                    };
+                                    if !already {
+                                        let mut l2 = ctx.global_git_l2.write().unwrap();
+                                        let p_idx = l2.post_next;
+                                        l2.post_next = (p_idx + 1) & 1;
+                                        l2.post_slots[p_idx] = Some(GlobalRawEntry {
+                                            epoch: ep,
+                                            raw_req: raw.to_vec(),
+                                            target: target_b.to_vec(),
+                                            resp: L1Bytes::Arc(arc.clone()),
+                                            is_v2: true,
+                                        });
+                                    }
                                 } else {
                                     slot.raw_req.clear();
                                 }

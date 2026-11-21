@@ -267,7 +267,8 @@ pub struct GitObject {
     pub kind: ObjKind,
     pub data: Vec<u8>,
     pub tree_oid: Option<[u8; 20]>,
-    pub parents: Vec<[u8; 20]>,
+    pub parent0: Option<[u8; 20]>,
+    pub extra_parents: Vec<[u8; 20]>,
     pub tag_target: Option<[u8; 20]>,
     pub compressed: OnceLock<Vec<u8>>,
 }
@@ -276,11 +277,32 @@ impl GitObject {
     pub fn compressed_bytes(&self) -> &[u8] {
         self.compressed.get_or_init(|| deflate_best(&self.data))
     }
+
+    #[inline]
+    pub fn has_parents(&self) -> bool {
+        self.parent0.is_some()
+    }
+
+    #[inline]
+    pub fn has_parent(&self, oid: &[u8; 20]) -> bool {
+        self.parent0.as_ref() == Some(oid) || self.extra_parents.contains(oid)
+    }
+
+    #[inline]
+    pub fn for_each_parent(&self, mut f: impl FnMut([u8; 20])) {
+        if let Some(p0) = self.parent0 {
+            f(p0);
+        }
+        for &p in &self.extra_parents {
+            f(p);
+        }
+    }
 }
 
-pub fn make_git_object(oid: [u8; 20], kind: ObjKind, data: Vec<u8>) -> Arc<GitObject> {
+pub fn make_git_object(oid: [u8; 20], kind: ObjKind, data: Vec<u8>) -> GitObject {
     let mut tree_oid = None;
-    let mut parents = Vec::new();
+    let mut parent0 = None;
+    let mut extra_parents = Vec::new();
     let mut tag_target = None;
 
     match kind {
@@ -293,7 +315,11 @@ pub fn make_git_object(oid: [u8; 20], kind: ObjKind, data: Vec<u8>) -> Arc<GitOb
                     }
                 } else if let Some(rest) = line.strip_prefix(b"parent ") {
                     if let Some(p) = hex_to_oid(rest.trim_ascii_end()) {
-                        parents.push(p);
+                        if parent0.is_none() {
+                            parent0 = Some(p);
+                        } else {
+                            extra_parents.push(p);
+                        }
                     }
                 }
             }
@@ -311,15 +337,16 @@ pub fn make_git_object(oid: [u8; 20], kind: ObjKind, data: Vec<u8>) -> Arc<GitOb
         ObjKind::Tree | ObjKind::Blob => {}
     }
 
-    Arc::new(GitObject {
+    GitObject {
         oid,
         kind,
         data,
         tree_oid,
-        parents,
+        parent0,
+        extra_parents,
         tag_target,
         compressed: OnceLock::new(),
-    })
+    }
 }
 
 fn find_double_nl(data: &[u8]) -> Option<usize> {
@@ -601,7 +628,7 @@ pub struct Repo {
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
-    pub objects: FxHashMap<[u8; 20], Arc<GitObject>>,
+    pub objects: FxHashMap<[u8; 20], GitObject>,
     pub refs: BTreeMap<String, [u8; 20]>,
     pub labels: FxHashMap<String, Label>,
     pub label_order: Vec<String>,
@@ -667,12 +694,13 @@ impl Repo {
         if tip.kind != ObjKind::Commit {
             return false;
         }
-        if tip.parents.contains(ancestor_oid) {
+        if tip.has_parent(ancestor_oid) {
             return true;
         }
         let mut visited = FxHashSet::default();
         visited.insert(*descendant_oid);
-        let mut queue = tip.parents.clone();
+        let mut queue = Vec::with_capacity(8);
+        tip.for_each_parent(|p| queue.push(p));
         while let Some(cur) = queue.pop() {
             if &cur == ancestor_oid {
                 return true;
@@ -681,11 +709,11 @@ impl Repo {
                 continue;
             }
             if let Some(obj) = self.objects.get(&cur) {
-                for &p in &obj.parents {
+                obj.for_each_parent(|p| {
                     if !visited.contains(&p) {
                         queue.push(p);
                     }
-                }
+                });
             }
         }
         false
@@ -814,7 +842,7 @@ impl Repo {
                 continue;
             }
             if let Some(obj) = self.objects.get(&c) {
-                qa.extend_from_slice(&obj.parents);
+                obj.for_each_parent(|p| qa.push(p));
             }
         }
         let mut visited_b = FxHashSet::default();
@@ -828,9 +856,7 @@ impl Repo {
                 continue;
             }
             if let Some(obj) = self.objects.get(&c) {
-                for &p in &obj.parents {
-                    qb.push_back(p);
-                }
+                obj.for_each_parent(|p| qb.push_back(p));
             }
         }
         None
@@ -1101,11 +1127,11 @@ impl StoreInner {
             default_branch: "main".to_string(),
             created_at: iso.clone(),
             updated_at: iso,
-            objects: FxHashMap::default(),
+            objects: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             refs: BTreeMap::new(),
             labels: FxHashMap::default(),
             label_order: Vec::new(),
-            issues: FxHashMap::default(),
+            issues: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             issue_order: Vec::new(),
             pulls: FxHashMap::default(),
             pull_order: Vec::new(),
@@ -1415,6 +1441,55 @@ impl StoreInner {
         pr.merge_commit_sha = Some(merge_sha);
         pr.updated_at = iso;
         Ok(merge_sha)
+    }
+
+    #[inline]
+    pub fn apply_single_push_command(
+        &mut self,
+        repo_id: u64,
+        cmd: &PushCommandRef<'_>,
+    ) -> (bool, &'static str) {
+        let Some(repo) = self.repos.get_mut(&repo_id) else {
+            return (false, "rejected");
+        };
+        let current_oid = repo.refs.get(cmd.ref_name).copied().unwrap_or(ZERO_OID);
+        if cmd.new_oid == ZERO_OID {
+            if current_oid == ZERO_OID || (cmd.old_oid != ZERO_OID && current_oid != cmd.old_oid) {
+                return (false, "stale old oid");
+            }
+            repo.refs.remove(cmd.ref_name);
+            repo.invalidate_git_caches();
+            return (true, "");
+        }
+
+        let Some(target_kind) = repo.objects.get(&cmd.new_oid).map(|o| o.kind) else {
+            return (false, "missing object");
+        };
+
+        if current_oid == ZERO_OID {
+            if cmd.old_oid != ZERO_OID {
+                return (false, "non-fast-forward");
+            }
+            repo.refs.insert(cmd.ref_name.to_string(), cmd.new_oid);
+            repo.invalidate_git_caches();
+            return (true, "");
+        }
+
+        if cmd.old_oid != ZERO_OID && cmd.old_oid != current_oid {
+            return (false, "non-fast-forward");
+        }
+
+        if target_kind == ObjKind::Commit && !repo.is_ancestor(&current_oid, &cmd.new_oid) {
+            return (false, "non-fast-forward");
+        }
+
+        if let Some(slot) = repo.refs.get_mut(cmd.ref_name) {
+            *slot = cmd.new_oid;
+        } else {
+            repo.refs.insert(cmd.ref_name.to_string(), cmd.new_oid);
+        }
+        repo.invalidate_git_caches();
+        (true, "")
     }
 
     pub fn apply_push_commands_ref(

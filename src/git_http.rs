@@ -388,11 +388,11 @@ fn compute_fetch_plan(
                 }
             }
             if !client_shallows.contains(&oid) {
-                for &p in &obj.parents {
+                obj.for_each_parent(|p| {
                     if !visited_haves.contains(&p) {
                         have_q.push(p);
                     }
-                }
+                });
             }
         }
     }
@@ -450,15 +450,15 @@ fn compute_fetch_plan(
                 included_commits.push(oid);
             }
             if d >= max_depth {
-                if !obj.parents.is_empty() {
+                if obj.has_parents() {
                     shallow_marks.insert(oid);
                 }
                 continue;
             }
-            if client_shallows.contains(&oid) && !obj.parents.is_empty() {
+            if client_shallows.contains(&oid) && obj.has_parents() {
                 unshallow_marks.insert(oid);
             }
-            for &p in &obj.parents {
+            obj.for_each_parent(|p| {
                 let replace = match min_depth.get(&p) {
                     None => true,
                     Some(&prev) => d + 1 < prev,
@@ -467,7 +467,7 @@ fn compute_fetch_plan(
                     min_depth.insert(p, d + 1);
                     queue.push_back((p, d + 1));
                 }
-            }
+            });
         }
         shallow_out.extend(shallow_marks);
         unshallow_out.extend(unshallow_marks);
@@ -488,11 +488,11 @@ fn compute_fetch_plan(
             if client_shallows.contains(&oid) {
                 continue;
             }
-            for &p in &obj.parents {
+            obj.for_each_parent(|p| {
                 if !visited.contains(&p) && !excluded.contains(&p) {
                     stack.push(p);
                 }
-            }
+            });
         }
     }
 
@@ -1027,6 +1027,64 @@ pub fn try_handle_git_http(
                 return Some(GitResponse::Written);
             }
             Ok(objs) => {
+                if commands.len() == 1 {
+                    let cmd = &commands[0];
+                    let ((ok, reason), updated_receive_adv) = {
+                        let mut g = store.inner.write().unwrap();
+                        let Some(repo_id) = g.find_repo_id(&owner, &repo_name) else {
+                            write_json_err_into(write_buf, 404, "Not Found");
+                            return Some(GitResponse::Written);
+                        };
+                        if let Some(repo) = g.repos.get_mut(&repo_id) {
+                            repo.put_decoded(objs);
+                        }
+                        let res = g.apply_single_push_command(repo_id, cmd);
+                        let adv_upd = if res.0 {
+                            let new_epoch = store.bump_git_epoch_val();
+                            let repo = g.repos.get_mut(&repo_id).unwrap();
+                            let adv = build_receive_v0_http(repo);
+                            repo.receive_v0_http_cache = Some(adv.clone());
+                            Some((adv, new_epoch))
+                        } else {
+                            None
+                        };
+                        (res, adv_upd)
+                    };
+
+                    let report_len = if ok {
+                        14 + 4 + (4 + 3 + cmd.ref_name.len() + 1)
+                    } else {
+                        let r = if reason.is_empty() { "rejected" } else { reason };
+                        14 + 4 + (4 + 3 + cmd.ref_name.len() + 1 + r.len() + 1)
+                    };
+                    let body_len = if use_sideband { 5 + report_len + 4 } else { report_len };
+                    write_git_http_header(write_buf, b"application/x-git-receive-pack-result", body_len);
+                    if use_sideband {
+                        push_hex4(write_buf, 5 + report_len);
+                        write_buf.push(0x01);
+                    }
+                    write_buf.extend_from_slice(b"000eunpack ok\n");
+                    if ok {
+                        push_hex4(write_buf, 4 + 3 + cmd.ref_name.len() + 1);
+                        write_buf.extend_from_slice(b"ok ");
+                        write_buf.extend_from_slice(cmd.ref_name.as_bytes());
+                        write_buf.push(b'\n');
+                    } else {
+                        let r = if reason.is_empty() { "rejected" } else { reason };
+                        push_hex4(write_buf, 4 + 3 + cmd.ref_name.len() + 1 + r.len() + 1);
+                        write_buf.extend_from_slice(b"ng ");
+                        write_buf.extend_from_slice(cmd.ref_name.as_bytes());
+                        write_buf.push(b' ');
+                        write_buf.extend_from_slice(r.as_bytes());
+                        write_buf.push(b'\n');
+                    }
+                    write_buf.extend_from_slice(PKT_FLUSH);
+                    if use_sideband {
+                        write_buf.extend_from_slice(PKT_FLUSH);
+                    }
+                    return Some(GitResponse::PushWritten { updated_receive_adv });
+                }
+
                 let (outcomes, updated_receive_adv) = {
                     let mut g = store.inner.write().unwrap();
                     let Some(repo_id) = g.find_repo_id(&owner, &repo_name) else {
