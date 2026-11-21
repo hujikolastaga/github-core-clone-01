@@ -12,12 +12,14 @@ pub struct DecodedObject {
 
 pub struct PackDecoder {
     decomp: Decompress,
+    scratch: Vec<u8>,
 }
 
 impl PackDecoder {
     pub fn new() -> Self {
         Self {
             decomp: Decompress::new(true),
+            scratch: Vec::with_capacity(8192),
         }
     }
 
@@ -48,6 +50,10 @@ impl PackDecoder {
             return Err("Packfile checksum mismatch".to_string());
         }
 
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
         enum EntrySpec {
             Base { kind: ObjKind },
             OfsDelta { base_offset: usize },
@@ -60,10 +66,16 @@ impl PackDecoder {
             data: Vec<u8>,
         }
 
-        let mut entries = Vec::with_capacity(count.min(4096));
+        // Fast path for base-only packs (such as bench pushes): avoid allocating
+        // delta tracking maps unless an OFS_DELTA or REF_DELTA actually appears.
+        let mut base_objs: Vec<DecodedObject> = Vec::with_capacity(count.min(4096));
+        let mut base_offsets: Vec<usize> = Vec::with_capacity(count.min(4096));
+
+        let mut delta_mode = false;
+        let mut entries: Vec<RawEntry> = Vec::new();
         let mut by_offset: FxHashMap<usize, usize> = FxHashMap::default();
         let mut by_oid: FxHashMap<[u8; 20], usize> = FxHashMap::default();
-        let mut resolved: Vec<Option<(ObjKind, Vec<u8>, [u8; 20])>> = Vec::with_capacity(count.min(4096));
+        let mut resolved: Vec<Option<(ObjKind, Vec<u8>, [u8; 20])>> = Vec::new();
 
         let mut pos = 12usize;
         for _ in 0..count {
@@ -86,6 +98,21 @@ impl PackDecoder {
                     declared_size |= ((b & 0x7f) as usize) << shift;
                 }
                 shift += 7;
+            }
+
+            if !delta_mode && (1..=4).contains(&type_code) {
+                let kind = ObjKind::from_pack_code(type_code).unwrap();
+                let (out_len, consumed) = self.inflate_into_scratch(&payload[pos..], declared_size)?;
+                pos += consumed;
+                let inflated = &self.scratch[..out_len];
+                let oid = hash_git_object(kind, inflated);
+                base_offsets.push(entry_offset);
+                base_objs.push(DecodedObject {
+                    oid,
+                    kind,
+                    data: inflated.to_vec(),
+                });
+                continue;
             }
 
             let spec = match type_code {
@@ -124,8 +151,27 @@ impl PackDecoder {
                 _ => return Err(format!("Unsupported pack object type {type_code}")),
             };
 
-            let (inflated, consumed) = self.inflate_one(&payload[pos..], declared_size)?;
+            if !delta_mode {
+                delta_mode = true;
+                let extra_rem = count.saturating_sub(base_objs.len()).min(4096);
+                entries.reserve(base_objs.len() + extra_rem);
+                resolved.reserve(base_objs.len() + extra_rem);
+                for (i, obj) in base_objs.drain(..).enumerate() {
+                    let off = base_offsets[i];
+                    by_offset.insert(off, i);
+                    by_oid.insert(obj.oid, i);
+                    resolved.push(Some((obj.kind, obj.data, obj.oid)));
+                    entries.push(RawEntry {
+                        offset: off,
+                        spec: EntrySpec::Base { kind: obj.kind },
+                        data: Vec::new(),
+                    });
+                }
+            }
+
+            let (out_len, consumed) = self.inflate_into_scratch(&payload[pos..], declared_size)?;
             pos += consumed;
+            let inflated = self.scratch[..out_len].to_vec();
 
             let idx = entries.len();
             match &spec {
@@ -149,6 +195,10 @@ impl PackDecoder {
                     });
                 }
             }
+        }
+
+        if !delta_mode {
+            return Ok(base_objs);
         }
 
         let mut remaining = entries
@@ -215,23 +265,25 @@ impl PackDecoder {
         Ok(out)
     }
 
-    fn inflate_one(&mut self, input: &[u8], declared_size: usize) -> Result<(Vec<u8>, usize), String> {
+    fn inflate_into_scratch(&mut self, input: &[u8], declared_size: usize) -> Result<(usize, usize), String> {
         self.decomp.reset(true);
-        let init_cap = declared_size.max(64).min(8 * 1024 * 1024);
-        let mut out = vec![0u8; init_cap];
+        let init_cap = declared_size.max(256).min(8 * 1024 * 1024);
+        if self.scratch.len() < init_cap {
+            self.scratch.resize(init_cap, 0);
+        }
         let mut in_pos = 0usize;
         let mut out_pos = 0usize;
 
         loop {
-            if out_pos == out.len() {
-                let next_len = out.len().saturating_mul(2).max(out_pos + 256);
-                out.resize(next_len, 0);
+            if out_pos == self.scratch.len() {
+                let next_len = self.scratch.len().saturating_mul(2).max(out_pos + 256);
+                self.scratch.resize(next_len, 0);
             }
             let before_in = self.decomp.total_in();
             let before_out = self.decomp.total_out();
             let status = self
                 .decomp
-                .decompress(&input[in_pos..], &mut out[out_pos..], FlushDecompress::None)
+                .decompress(&input[in_pos..], &mut self.scratch[out_pos..], FlushDecompress::None)
                 .map_err(|e| format!("zlib inflate error: {e}"))?;
             let consumed_now = (self.decomp.total_in() - before_in) as usize;
             let produced_now = (self.decomp.total_out() - before_out) as usize;
@@ -239,17 +291,14 @@ impl PackDecoder {
             out_pos += produced_now;
 
             match status {
-                Status::StreamEnd => {
-                    out.truncate(out_pos);
-                    return Ok((out, in_pos));
-                }
+                Status::StreamEnd => return Ok((out_pos, in_pos)),
                 Status::Ok => {
                     if consumed_now == 0 && produced_now == 0 && in_pos >= input.len() {
                         return Err("Truncated zlib stream in packfile".to_string());
                     }
                 }
                 Status::BufError => {
-                    if out_pos == out.len() {
+                    if out_pos == self.scratch.len() {
                         continue;
                     }
                     if in_pos >= input.len() {

@@ -4,7 +4,6 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use crate::git_http::{try_handle_git_http, GitResponse};
 use crate::graphql::handle_graphql;
@@ -13,11 +12,12 @@ use crate::pack::PackDecoder;
 use crate::rest::{handle_rest_api, not_found_http, RestResponse};
 use crate::store::{base64_decode_lenient, build_http_response, ForgeStore};
 
-const WORKER_COUNT: usize = 100;
-const MAX_TOTAL_WORKERS: usize = 210;
+const WORKER_COUNT: usize = 64;
+const MAX_TOTAL_WORKERS: usize = 160;
+const WORKER_STACK_BYTES: usize = 512 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-const HEALTHZ_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n{\"ok\":true}";
-const HEALTHZ_HEAD_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n";
+const HEALTHZ_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n{\"ok\":true}";
+const HEALTHZ_HEAD_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n";
 
 struct QueueState {
     conns: VecDeque<TcpStream>,
@@ -48,13 +48,13 @@ impl AppContext {
         let auth_body = br#"{"message":"Requires authentication"}"#;
         let err_auth_http = build_http_response(
             b"HTTP/1.1 401 Unauthorized",
-            b"application/json; charset=utf-8",
+            b"application/json",
             b"",
             auth_body,
         );
         let err_auth_git_http = build_http_response(
             b"HTTP/1.1 401 Unauthorized",
-            b"application/json; charset=utf-8",
+            b"application/json",
             b"WWW-Authenticate: Basic realm=\"GitHub Forge\"\r\n",
             auth_body,
         );
@@ -81,6 +81,7 @@ impl AppContext {
             ctx.total_workers.fetch_add(1, Ordering::Relaxed);
             thread::Builder::new()
                 .name("forge-worker".to_string())
+                .stack_size(WORKER_STACK_BYTES)
                 .spawn(move || worker_loop(ctx))
                 .expect("spawn worker thread");
         }
@@ -97,6 +98,7 @@ impl AppContext {
             ctx_sub.total_workers.fetch_add(1, Ordering::Relaxed);
             let spawned = thread::Builder::new()
                 .name("forge-overflow".to_string())
+                .stack_size(WORKER_STACK_BYTES)
                 .spawn(move || {
                     overflow_conn_run(&ctx, stream);
                     ctx.total_workers.fetch_sub(1, Ordering::Relaxed);
@@ -147,6 +149,7 @@ impl L1Bytes {
 
 struct GitPostSlot {
     epoch: u64,
+    raw_req: Vec<u8>,
     target: Vec<u8>,
     body: Vec<u8>,
     resp: Option<L1Bytes>,
@@ -156,6 +159,7 @@ impl GitPostSlot {
     fn empty() -> Self {
         Self {
             epoch: 0,
+            raw_req: Vec::new(),
             target: Vec::new(),
             body: Vec::new(),
             resp: None,
@@ -167,6 +171,7 @@ struct WorkerL1Cache {
     get_epoch: u64,
     get_is_git: bool,
     get_is_v2: bool,
+    raw_get_req: Vec<u8>,
     get_path: Vec<u8>,
     get_resp: Option<L1Bytes>,
     git_post: [GitPostSlot; 2],
@@ -179,6 +184,7 @@ impl WorkerL1Cache {
             get_epoch: 0,
             get_is_git: false,
             get_is_v2: false,
+            raw_get_req: Vec::new(),
             get_path: Vec::with_capacity(96),
             get_resp: None,
             git_post: [GitPostSlot::empty(), GitPostSlot::empty()],
@@ -191,6 +197,7 @@ fn worker_loop(ctx: Arc<AppContext>) {
     let mut decoder = PackDecoder::new();
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut chunk_buf = Vec::with_capacity(4096);
+    let mut body_scratch = Vec::with_capacity(2048);
     let mut write_buf = Vec::with_capacity(8192);
     let mut l1 = WorkerL1Cache::new();
 
@@ -217,6 +224,7 @@ fn worker_loop(ctx: Arc<AppContext>) {
             &mut decoder,
             &mut read_buf,
             &mut chunk_buf,
+            &mut body_scratch,
             &mut write_buf,
             &mut l1,
         );
@@ -227,6 +235,7 @@ fn overflow_conn_run(ctx: &Arc<AppContext>, stream: TcpStream) {
     let mut decoder = PackDecoder::new();
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut chunk_buf = Vec::with_capacity(4096);
+    let mut body_scratch = Vec::with_capacity(2048);
     let mut write_buf = Vec::with_capacity(8192);
     let mut l1 = WorkerL1Cache::new();
     handle_connection(
@@ -235,6 +244,7 @@ fn overflow_conn_run(ctx: &Arc<AppContext>, stream: TcpStream) {
         &mut decoder,
         &mut read_buf,
         &mut chunk_buf,
+        &mut body_scratch,
         &mut write_buf,
         &mut l1,
     );
@@ -301,16 +311,65 @@ fn handle_connection(
     decoder: &mut PackDecoder,
     read_buf: &mut Vec<u8>,
     chunk_buf: &mut Vec<u8>,
+    body_scratch: &mut Vec<u8>,
     write_buf: &mut Vec<u8>,
     l1: &mut WorkerL1Cache,
 ) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
     let mut filled = 0usize;
 
     loop {
+        if filled == 0 {
+            match stream.read(&mut read_buf[..]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    filled = n;
+                    if n <= 4096 {
+                        if read_buf[0] == b'G'
+                            && n == l1.raw_get_req.len()
+                            && &read_buf[..n] == l1.raw_get_req.as_slice()
+                        {
+                            if let Some(resp) = &l1.get_resp {
+                                let cur_epoch = if l1.get_is_git {
+                                    ctx.store.git_epoch.load(Ordering::Acquire)
+                                } else {
+                                    ctx.store.read_epoch.load(Ordering::Acquire)
+                                };
+                                if cur_epoch == l1.get_epoch {
+                                    if stream.write_all(resp.as_slice()).is_err() {
+                                        return;
+                                    }
+                                    filled = 0;
+                                    continue;
+                                }
+                            }
+                        } else if read_buf[0] == b'P' {
+                            let cur_git_epoch = ctx.store.git_epoch.load(Ordering::Acquire);
+                            let mut hit_raw: Option<&[u8]> = None;
+                            for slot in &l1.git_post {
+                                if slot.epoch == cur_git_epoch
+                                    && n == slot.raw_req.len()
+                                    && &read_buf[..n] == slot.raw_req.as_slice()
+                                {
+                                    if let Some(r) = &slot.resp {
+                                        hit_raw = Some(r.as_slice());
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(bytes) = hit_raw {
+                                if stream.write_all(bytes).is_err() {
+                                    return;
+                                }
+                                filled = 0;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let header_end = loop {
             if let Some(end) = find_header_end(&read_buf[..filled]) {
@@ -393,32 +452,52 @@ fn handle_connection(
                 let abs_start = hline_base + colon + 1 + v_start;
                 let abs_end = hline_base + colon + 1 + v_end;
 
-                if hname.eq_ignore_ascii_case(b"authorization") {
-                    auth_r = Some((abs_start, abs_end));
-                } else if hname.eq_ignore_ascii_case(b"content-length") {
-                    if let Ok(s) = std::str::from_utf8(hval) {
-                        if let Ok(cl) = s.parse::<usize>() {
+                if hname.is_empty() {
+                    continue;
+                }
+                match (hname.len(), hname[0] | 0x20) {
+                    (13, b'a') if hname.eq_ignore_ascii_case(b"authorization") => {
+                        auth_r = Some((abs_start, abs_end));
+                    }
+                    (14, b'c') if hname.eq_ignore_ascii_case(b"content-length") => {
+                        let mut cl = 0usize;
+                        let mut ok = !hval.is_empty();
+                        for &b in hval {
+                            if b.is_ascii_digit() {
+                                cl = cl.saturating_mul(10).saturating_add((b - b'0') as usize);
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
                             content_len = cl;
                         }
                     }
-                } else if hname.eq_ignore_ascii_case(b"transfer-encoding") {
-                    if contains_ascii_ci(hval, b"chunked") {
-                        is_chunked = true;
+                    (17, b't') if hname.eq_ignore_ascii_case(b"transfer-encoding") => {
+                        if contains_ascii_ci(hval, b"chunked") {
+                            is_chunked = true;
+                        }
                     }
-                } else if hname.eq_ignore_ascii_case(b"connection") {
-                    if contains_ascii_ci(hval, b"close") {
-                        conn_close = true;
-                    } else if contains_ascii_ci(hval, b"keep-alive") {
-                        conn_close = false;
+                    (10, b'c') if hname.eq_ignore_ascii_case(b"connection") => {
+                        if contains_ascii_ci(hval, b"close") {
+                            conn_close = true;
+                        } else if conn_close && contains_ascii_ci(hval, b"keep-alive") {
+                            conn_close = false;
+                        }
                     }
-                } else if hname.eq_ignore_ascii_case(b"git-protocol") {
-                    git_proto_r = Some((abs_start, abs_end));
-                } else if hname.eq_ignore_ascii_case(b"host") {
-                    host_hdr_r = Some((abs_start, abs_end));
-                } else if hname.eq_ignore_ascii_case(b"expect")
-                    && contains_ascii_ci(hval, b"100-continue")
-                {
-                    expect_100 = true;
+                    (12, b'g') if hname.eq_ignore_ascii_case(b"git-protocol") => {
+                        git_proto_r = Some((abs_start, abs_end));
+                    }
+                    (4, b'h') if hname.eq_ignore_ascii_case(b"host") => {
+                        host_hdr_r = Some((abs_start, abs_end));
+                    }
+                    (6, b'e') if hname.eq_ignore_ascii_case(b"expect") => {
+                        if contains_ascii_ci(hval, b"100-continue") {
+                            expect_100 = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
             (
@@ -642,6 +721,7 @@ fn handle_connection(
                 } else {
                     &read_buf[body_start..body_start + content_len]
                 };
+                let cache_raw = !conn_close && !body_is_chunked && total_consumed <= 4096;
 
                 write_buf.clear();
                 if pathname == "/mcp" {
@@ -662,6 +742,7 @@ fn handle_connection(
                         query,
                         host_hdr,
                         body_slice,
+                        body_scratch,
                         write_buf,
                     ) {
                         RestResponse::Static(slice) => {
@@ -677,6 +758,12 @@ fn handle_connection(
                                 l1.get_path.clear();
                                 l1.get_path.extend_from_slice(target_b);
                                 l1.get_resp = Some(L1Bytes::Arc(arc.clone()));
+                                if cache_raw {
+                                    l1.raw_get_req.clear();
+                                    l1.raw_get_req.extend_from_slice(&read_buf[..total_consumed]);
+                                } else {
+                                    l1.raw_get_req.clear();
+                                }
                             }
                             if stream.write_all(&arc).is_err() {
                                 return;
@@ -707,6 +794,12 @@ fn handle_connection(
                                 l1.get_path.clear();
                                 l1.get_path.extend_from_slice(target_b);
                                 l1.get_resp = Some(L1Bytes::Static(slice));
+                                if cache_raw {
+                                    l1.raw_get_req.clear();
+                                    l1.raw_get_req.extend_from_slice(&read_buf[..total_consumed]);
+                                } else {
+                                    l1.raw_get_req.clear();
+                                }
                             }
                             if stream.write_all(slice).is_err() {
                                 return;
@@ -720,6 +813,12 @@ fn handle_connection(
                                 l1.get_path.clear();
                                 l1.get_path.extend_from_slice(target_b);
                                 l1.get_resp = Some(L1Bytes::Arc(arc.clone()));
+                                if cache_raw {
+                                    l1.raw_get_req.clear();
+                                    l1.raw_get_req.extend_from_slice(&read_buf[..total_consumed]);
+                                } else {
+                                    l1.raw_get_req.clear();
+                                }
                             } else if method_b == b"POST" && target_b.ends_with(b"/git-upload-pack") {
                                 let idx = l1.git_post_next;
                                 l1.git_post_next = (idx + 1) & 1;
@@ -730,9 +829,37 @@ fn handle_connection(
                                 slot.body.clear();
                                 slot.body.extend_from_slice(body_slice);
                                 slot.resp = Some(L1Bytes::Arc(arc.clone()));
+                                if cache_raw {
+                                    slot.raw_req.clear();
+                                    slot.raw_req.extend_from_slice(&read_buf[..total_consumed]);
+                                } else {
+                                    slot.raw_req.clear();
+                                }
                             }
                             if stream.write_all(&arc).is_err() {
                                 return;
+                            }
+                        }
+                        GitResponse::PushWritten { updated_receive_adv } => {
+                            if stream.write_all(write_buf).is_err() {
+                                return;
+                            }
+                            if let Some((adv_arc, new_epoch)) = updated_receive_adv {
+                                if l1.get_is_git
+                                    && l1
+                                        .get_path
+                                        .ends_with(b"/info/refs?service=git-receive-pack")
+                                {
+                                    if let (Some(p1), Some(p2)) = (
+                                        target_b.windows(5).position(|w| w == b".git/"),
+                                        l1.get_path.windows(5).position(|w| w == b".git/"),
+                                    ) {
+                                        if target_b[..p1] == l1.get_path[..p2] {
+                                            l1.get_epoch = new_epoch;
+                                            l1.get_resp = Some(L1Bytes::Arc(adv_arc));
+                                        }
+                                    }
+                                }
                             }
                         }
                         GitResponse::Written => {

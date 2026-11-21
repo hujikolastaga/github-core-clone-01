@@ -6,9 +6,10 @@ use serde_json::Value;
 
 use crate::sha1::{hex_to_oid, oid_to_string, ZERO_OID};
 use crate::store::{
-    build_http_response, json_escape_into, parse_commit_message_and_author, percent_decode,
-    write_issue_json_into, Comment, ForgeStore, Issue, Label, Pull, PullFileChange,
-    ReadContentsResult, Repo, VIEWER_EMAIL, VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME, VIEWER_NODE_ID,
+    build_http_response, cow_percent_decode, json_escape_into, parse_commit_message_and_author,
+    percent_decode, write_issue_json_into, Comment, ForgeStore, Issue, Label, Pull,
+    PullFileChange, ReadContentsResult, Repo, VIEWER_EMAIL, VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME,
+    VIEWER_NODE_ID,
 };
 
 static API_ROOT_HTTP: OnceLock<Vec<u8>> = OnceLock::new();
@@ -20,7 +21,7 @@ pub fn not_found_http() -> &'static [u8] {
     NOT_FOUND_HTTP.get_or_init(|| {
         build_http_response(
             b"HTTP/1.1 404 Not Found",
-            b"application/json; charset=utf-8",
+            b"application/json",
             b"",
             b"{\"message\":\"Not Found\"}",
         )
@@ -32,7 +33,7 @@ fn api_root_http() -> &'static [u8] {
         let body = br#"{"current_user_url":"/api/v3/user","user_repositories_url":"/api/v3/user/repos","repository_url":"/api/v3/repos/{owner}/{repo}","rate_limit_url":"/api/v3/rate_limit"}"#;
         build_http_response(
             b"HTTP/1.1 200 OK",
-            b"application/json; charset=utf-8",
+            b"application/json",
             b"X-OAuth-Scopes: repo, read:org\r\n",
             body,
         )
@@ -44,7 +45,7 @@ fn api_meta_http() -> &'static [u8] {
         let body = br#"{"installed_version":"3.14.0","verifiable_password_authentication":false}"#;
         build_http_response(
             b"HTTP/1.1 200 OK",
-            b"application/json; charset=utf-8",
+            b"application/json",
             b"",
             body,
         )
@@ -75,9 +76,9 @@ pub fn write_http_json(write_buf: &mut Vec<u8>, status: u16, extra_headers: &[u8
     let sl = status_line_for(status);
     let mut len_buf = itoa::Buffer::new();
     let len_str = len_buf.format(body.len());
-    write_buf.reserve(sl.len() + extra_headers.len() + body.len() + 96);
+    write_buf.reserve(sl.len() + extra_headers.len() + body.len() + 80);
     write_buf.extend_from_slice(sl);
-    write_buf.extend_from_slice(b"\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ");
+    write_buf.extend_from_slice(b"\r\nContent-Type: application/json\r\nContent-Length: ");
     write_buf.extend_from_slice(len_str.as_bytes());
     write_buf.extend_from_slice(b"\r\nX-GitHub-Request-Id: 1\r\n");
     if !extra_headers.is_empty() {
@@ -391,6 +392,7 @@ pub fn handle_rest_api(
     query: &str,
     host_header: Option<&str>,
     body: &[u8],
+    body_scratch: &mut Vec<u8>,
     write_buf: &mut Vec<u8>,
 ) -> RestResponse {
     let sub = &pathname["/api/v3".len()..];
@@ -403,8 +405,8 @@ pub fn handle_rest_api(
                     let s2 = s1 + 1 + s2_rel;
                     if let Some(num_str) = after_repos[s2..].strip_prefix("/issues/") {
                         if let Some(num) = parse_ascii_uint(num_str) {
-                            let owner = percent_decode(&after_repos[..s1]);
-                            let repo_name = percent_decode(&after_repos[s1 + 1..s2]);
+                            let owner = cow_percent_decode(&after_repos[..s1]);
+                            let repo_name = cow_percent_decode(&after_repos[s1 + 1..s2]);
                             let cached_hit = {
                                 let g = store.inner.read().unwrap();
                                 g.get_repo(&owner, &repo_name)
@@ -434,8 +436,8 @@ pub fn handle_rest_api(
         if let Some(middle) = sub.strip_prefix("/repos/").and_then(|s| s.strip_suffix("/issues")) {
             if let Some(s1) = middle.find('/') {
                 if !middle[s1 + 1..].contains('/') {
-                    let owner = percent_decode(&middle[..s1]);
-                    let repo_name = percent_decode(&middle[s1 + 1..]);
+                    let owner = cow_percent_decode(&middle[..s1]);
+                    let repo_name = cow_percent_decode(&middle[s1 + 1..]);
 
                     if let Some((fast_title, fast_body)) = try_fast_parse_issue_json(body) {
                         let mut g = store.inner.write().unwrap();
@@ -450,9 +452,9 @@ pub fn handle_rest_api(
                             }
                         };
                         let issue = &g.repos.get(&repo_id).unwrap().issues[&num];
-                        let mut json_body = Vec::with_capacity(256 + fast_title.len() + fast_body.len());
-                        write_issue_json_into(&mut json_body, issue);
-                        write_http_json(write_buf, 201, b"", &json_body);
+                        body_scratch.clear();
+                        write_issue_json_into(body_scratch, issue);
+                        write_http_json(write_buf, 201, b"", body_scratch);
                         return RestResponse::Written;
                     }
 
@@ -493,9 +495,9 @@ pub fn handle_rest_api(
                         }
                     };
                     let issue = &g.repos.get(&repo_id).unwrap().issues[&num];
-                    let mut json_body = Vec::with_capacity(320);
-                    write_issue_json_into(&mut json_body, issue);
-                    write_http_json(write_buf, 201, b"", &json_body);
+                    body_scratch.clear();
+                    write_issue_json_into(body_scratch, issue);
+                    write_http_json(write_buf, 201, b"", body_scratch);
                     return RestResponse::Written;
                 }
             }
@@ -608,12 +610,12 @@ pub fn handle_rest_api(
     if slash1 == 0 {
         return RestResponse::Static(not_found_http());
     }
-    let owner = percent_decode(&repo_tail[..slash1]);
+    let owner = cow_percent_decode(&repo_tail[..slash1]);
     let (repo_name, resource) = match repo_tail[slash1 + 1..].find('/') {
-        None => (percent_decode(&repo_tail[slash1 + 1..]), ""),
+        None => (cow_percent_decode(&repo_tail[slash1 + 1..]), ""),
         Some(s2_rel) => {
             let s2 = slash1 + 1 + s2_rel;
-            (percent_decode(&repo_tail[slash1 + 1..s2]), &repo_tail[s2..])
+            (cow_percent_decode(&repo_tail[slash1 + 1..s2]), &repo_tail[s2..])
         }
     };
 

@@ -50,8 +50,7 @@ fn http_request(
     json_body: Option<&str>,
 ) -> Result<(u16, String), String> {
     let mut stream = TcpStream::connect(&url.host_port).map_err(|e| e.to_string())?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
 
     let full_path = format!("{}{}", url.base_path, sub_path);
@@ -154,6 +153,9 @@ fn wait_until_done(url: &ParsedUrl) {
     loop {
         if let Ok((status, body)) = http_request(url, "GET", "/done", None) {
             if (200..300).contains(&status) {
+                if body.contains("\"done\":true") || body.contains("\"done\": true") {
+                    return;
+                }
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
                     if val.get("done").and_then(|v| v.as_bool()) == Some(true) {
                         return;
@@ -161,7 +163,7 @@ fn wait_until_done(url: &ParsedUrl) {
                 }
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(1500));
     }
 }
 

@@ -1,11 +1,10 @@
-use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::pack::{empty_packfile, finalize_pack, push_pack_obj_header, DecodedObject, PackDecoder};
 use crate::sha1::{hex_to_oid, write_oid_hex, ObjKind, ZERO_OID_HEX};
-use crate::store::{build_http_response, ForgeStore, PushCommand, Repo};
+use crate::store::{build_http_response, ForgeStore, PushCommandRef, Repo};
 
 const MAX_SIDEBAND_CHUNK: usize = 65_500;
 const PKT_FLUSH: &[u8] = b"0000";
@@ -13,20 +12,29 @@ const PKT_DELIM: &[u8] = b"0001";
 
 static UPLOAD_V2_ADV_HTTP: OnceLock<Vec<u8>> = OnceLock::new();
 
+#[inline]
+fn write_git_http_header(out: &mut Vec<u8>, content_type: &[u8], body_len: usize) {
+    let mut len_buf = itoa::Buffer::new();
+    let len_str = len_buf.format(body_len);
+    out.reserve(48 + content_type.len() + len_str.len() + body_len);
+    out.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: ");
+    out.extend_from_slice(content_type);
+    out.extend_from_slice(b"\r\nContent-Length: ");
+    out.extend_from_slice(len_str.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+}
+
 fn build_git_http_resp(content_type: &[u8], body: &[u8]) -> Vec<u8> {
-    build_http_response(
-        b"HTTP/1.1 200 OK",
-        content_type,
-        b"Cache-Control: no-cache\r\n",
-        body,
-    )
+    let mut buf = Vec::new();
+    write_git_http_header(&mut buf, content_type, body.len());
+    buf.extend_from_slice(body);
+    buf
 }
 
 fn upload_v2_adv_http() -> &'static [u8] {
     UPLOAD_V2_ADV_HTTP.get_or_init(|| {
-        let mut body = Vec::with_capacity(128);
+        let mut body = Vec::with_capacity(96);
         push_pkt_line(&mut body, b"version 2\n");
-        push_pkt_line(&mut body, b"agent=makefun-forge/1.0\n");
         push_pkt_line(&mut body, b"ls-refs=unborn\n");
         push_pkt_line(&mut body, b"fetch=shallow wait-for-done\n");
         push_pkt_line(&mut body, b"object-format=sha1\n");
@@ -36,9 +44,18 @@ fn upload_v2_adv_http() -> &'static [u8] {
 }
 
 #[inline]
+fn push_hex4(out: &mut Vec<u8>, val: usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[(val >> 12) & 0xf]);
+    out.push(HEX[(val >> 8) & 0xf]);
+    out.push(HEX[(val >> 4) & 0xf]);
+    out.push(HEX[val & 0xf]);
+}
+
+#[inline]
 fn push_pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
     let total = payload.len() + 4;
-    let _ = write!(out, "{total:04x}");
+    push_hex4(out, total);
     out.extend_from_slice(payload);
 }
 
@@ -90,11 +107,90 @@ fn wrap_sideband_64k(out: &mut Vec<u8>, payload: &[u8]) {
         let end = (offset + MAX_SIDEBAND_CHUNK).min(payload.len());
         let slice = &payload[offset..end];
         let total = slice.len() + 5;
-        let _ = write!(out, "{total:04x}");
+        push_hex4(out, total);
         out.push(0x01);
         out.extend_from_slice(slice);
         offset = end;
     }
+}
+
+#[inline]
+fn parse_hex4(b: &[u8]) -> Option<usize> {
+    if b.len() < 4 {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in &b[..4] {
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as usize,
+            b'a'..=b'f' => (c - b'a' + 10) as usize,
+            b'A'..=b'F' => (c - b'A' + 10) as usize,
+            _ => return None,
+        };
+        v = (v << 4) | d;
+    }
+    Some(v)
+}
+
+fn parse_receive_pack_request<'a>(
+    buf: &'a [u8],
+) -> Result<(Vec<PushCommandRef<'a>>, bool, &'a [u8]), String> {
+    let mut commands = Vec::with_capacity(4);
+    let mut use_sideband = false;
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        if pos + 4 > buf.len() {
+            return Err("Truncated pkt-line header".to_string());
+        }
+        let Some(len) = parse_hex4(&buf[pos..pos + 4]) else {
+            return Err("Invalid pkt-line header".to_string());
+        };
+        pos += 4;
+        if len == 0 {
+            if pos + 4 <= buf.len() && &buf[pos..pos + 4] == b"PACK" {
+                return Ok((commands, use_sideband, &buf[pos..]));
+            }
+            continue;
+        }
+        if len == 1 || len == 2 {
+            continue;
+        }
+        if len < 4 || pos + (len - 4) > buf.len() {
+            return Err("Truncated pkt-line payload".to_string());
+        }
+        let raw = &buf[pos..pos + (len - 4)];
+        pos += len - 4;
+
+        let (main_raw, cap_opt) = match memchr::memchr(0, raw) {
+            Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
+            None => (raw, None),
+        };
+        if let Some(cap_bytes) = cap_opt {
+            for cap in cap_bytes.trim_ascii().split(|&b| b == b' ') {
+                if cap == b"side-band-64k" || cap == b"side-band" {
+                    use_sideband = true;
+                }
+            }
+        }
+        let main_trimmed = main_raw.strip_suffix(b"\n").unwrap_or(main_raw);
+        let mut parts = main_trimmed.splitn(3, |&b| b == b' ');
+        let (Some(old_b), Some(new_b), Some(ref_b)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err("Malformed receive-pack command line".to_string());
+        };
+        let (Some(old_oid), Some(new_oid), Ok(ref_name)) = (
+            hex_to_oid(old_b),
+            hex_to_oid(new_b),
+            std::str::from_utf8(ref_b),
+        ) else {
+            return Err("Malformed receive-pack command line".to_string());
+        };
+        commands.push(PushCommandRef {
+            old_oid,
+            new_oid,
+            ref_name,
+        });
+    }
+    Ok((commands, use_sideband, &[][..]))
 }
 
 fn build_upload_v0_http(repo: &Repo) -> Arc<Vec<u8>> {
@@ -155,40 +251,54 @@ fn build_upload_v0_http(repo: &Repo) -> Arc<Vec<u8>> {
 }
 
 fn build_receive_v0_http(repo: &Repo) -> Arc<Vec<u8>> {
-    let caps = b"report-status report-status-v2 side-band-64k delete-refs ofs-delta atomic agent=makefun-forge/1.0";
-    let mut body = Vec::with_capacity(256);
-    push_pkt_line(&mut body, b"# service=git-receive-pack\n");
-    body.extend_from_slice(PKT_FLUSH);
+    const SERVICE_PREAMBLE: &[u8] = b"001f# service=git-receive-pack\n0000";
+    const CAPS: &[u8] = b"report-status side-band-64k delete-refs ofs-delta";
+
+    let body_len = if repo.refs.is_empty() {
+        SERVICE_PREAMBLE.len() + (4 + 40 + 1 + 15 + 1 + CAPS.len() + 1) + 4
+    } else {
+        let mut len = SERVICE_PREAMBLE.len() + 4;
+        let mut first = true;
+        for name in repo.refs.keys() {
+            len += 4 + 40 + 1 + name.len() + if first { 1 + CAPS.len() } else { 0 } + 1;
+            first = false;
+        }
+        len
+    };
+
+    let mut out = Vec::new();
+    write_git_http_header(
+        &mut out,
+        b"application/x-git-receive-pack-advertisement",
+        body_len,
+    );
+    out.extend_from_slice(SERVICE_PREAMBLE);
 
     if repo.refs.is_empty() {
-        let mut line = Vec::with_capacity(64 + caps.len());
-        line.extend_from_slice(ZERO_OID_HEX.as_bytes());
-        line.extend_from_slice(b" capabilities^{}\0");
-        line.extend_from_slice(caps);
-        line.push(b'\n');
-        push_pkt_line(&mut body, &line);
-        body.extend_from_slice(PKT_FLUSH);
+        let pkt_len = 4 + 40 + 1 + 15 + 1 + CAPS.len() + 1;
+        push_hex4(&mut out, pkt_len);
+        out.extend_from_slice(ZERO_OID_HEX.as_bytes());
+        out.extend_from_slice(b" capabilities^{}\0");
+        out.extend_from_slice(CAPS);
+        out.push(b'\n');
     } else {
         let mut first = true;
         for (name, oid) in &repo.refs {
-            let mut line = Vec::with_capacity(48 + name.len() + if first { caps.len() } else { 0 });
-            write_oid_hex(&mut line, oid);
-            line.push(b' ');
-            line.extend_from_slice(name.as_bytes());
+            let pkt_len = 4 + 40 + 1 + name.len() + if first { 1 + CAPS.len() } else { 0 } + 1;
+            push_hex4(&mut out, pkt_len);
+            write_oid_hex(&mut out, oid);
+            out.push(b' ');
+            out.extend_from_slice(name.as_bytes());
             if first {
-                line.push(0);
-                line.extend_from_slice(caps);
+                out.push(0);
+                out.extend_from_slice(CAPS);
                 first = false;
             }
-            line.push(b'\n');
-            push_pkt_line(&mut body, &line);
+            out.push(b'\n');
         }
-        body.extend_from_slice(PKT_FLUSH);
     }
-    Arc::new(build_git_http_resp(
-        b"application/x-git-receive-pack-advertisement",
-        &body,
-    ))
+    out.extend_from_slice(PKT_FLUSH);
+    Arc::new(out)
 }
 
 fn collect_tree_and_blobs(
@@ -669,6 +779,9 @@ fn query_get<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 pub enum GitResponse {
     Static(&'static [u8]),
     Cached(Arc<Vec<u8>>),
+    PushWritten {
+        updated_receive_adv: Option<(Arc<Vec<u8>>, u64)>,
+    },
     Written,
 }
 
@@ -825,61 +938,14 @@ pub fn try_handle_git_http(
         return Some(GitResponse::Cached(built_arc));
     }
 
-    let repo_id = {
-        let g = store.inner.read().unwrap();
-        match g.find_repo_id(&owner, &repo_name) {
-            Some(id) => id,
-            None => {
-                write_json_err_into(write_buf, 404, "Not Found");
-                return Some(GitResponse::Written);
-            }
-        }
-    };
-
     if method == "POST" && sub_path == "/git-receive-pack" {
-        let (lines, pack_bytes) = match parse_pkt_stream(body) {
+        let (commands, use_sideband, pack_bytes) = match parse_receive_pack_request(body) {
             Ok(p) => p,
             Err(err) => {
                 write_json_err_into(write_buf, 400, &err);
                 return Some(GitResponse::Written);
             }
         };
-
-        let mut commands = Vec::with_capacity(4);
-        let mut use_sideband = false;
-        for &item in &lines {
-            let PktItem::Line(raw) = item else { continue };
-            let (main_raw, cap_opt) = match memchr::memchr(0, raw) {
-                Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
-                None => (raw, None),
-            };
-            if let Some(cap_bytes) = cap_opt {
-                for cap in cap_bytes.trim_ascii().split(|&b| b == b' ') {
-                    if cap == b"side-band-64k" || cap == b"side-band" {
-                        use_sideband = true;
-                    }
-                }
-            }
-            let main_trimmed = main_raw.strip_suffix(b"\n").unwrap_or(main_raw);
-            let mut parts = main_trimmed.splitn(3, |&b| b == b' ');
-            let (Some(old_b), Some(new_b), Some(ref_b)) = (parts.next(), parts.next(), parts.next()) else {
-                write_json_err_into(write_buf, 400, "Malformed receive-pack command line");
-                return Some(GitResponse::Written);
-            };
-            let (Some(old_oid), Some(new_oid), Ok(ref_str)) = (
-                hex_to_oid(old_b),
-                hex_to_oid(new_b),
-                std::str::from_utf8(ref_b),
-            ) else {
-                write_json_err_into(write_buf, 400, "Malformed receive-pack command line");
-                return Some(GitResponse::Written);
-            };
-            commands.push(PushCommand {
-                old_oid,
-                new_oid,
-                ref_name: ref_str.to_string(),
-            });
-        }
 
         // Decode & SHA-1 verify incoming pack outside write lock first.
         let decoded_res: Result<Vec<DecodedObject>, String> = if pack_bytes.is_empty() {
@@ -889,7 +955,10 @@ pub fn try_handle_git_http(
                 Ok(objs) => Ok(objs),
                 Err(err) if err.starts_with("Missing REF_DELTA base ") => {
                     let g = store.inner.read().unwrap();
-                    match g.repos.get(&repo_id) {
+                    match g
+                        .find_repo_id(&owner, &repo_name)
+                        .and_then(|id| g.repos.get(&id))
+                    {
                         Some(repo) => decoder.decode_pack(pack_bytes, |oid| {
                             repo.objects.get(oid).map(|o| (o.kind, o.data.clone()))
                         }),
@@ -900,67 +969,156 @@ pub fn try_handle_git_http(
             }
         };
 
-        let mut report = Vec::with_capacity(256);
         match decoded_res {
             Err(unpack_err) => {
-                let mut line = Vec::with_capacity(32 + unpack_err.len());
-                line.extend_from_slice(b"unpack error ");
-                line.extend_from_slice(unpack_err.as_bytes());
-                line.push(b'\n');
-                push_pkt_line(&mut report, &line);
-                for cmd in &commands {
-                    let mut l = Vec::with_capacity(24 + cmd.ref_name.len());
-                    l.extend_from_slice(b"ng ");
-                    l.extend_from_slice(cmd.ref_name.as_bytes());
-                    l.extend_from_slice(b" unpack failed\n");
-                    push_pkt_line(&mut report, &l);
+                let exists = store.inner.read().unwrap().find_repo_id(&owner, &repo_name).is_some();
+                if !exists {
+                    write_json_err_into(write_buf, 404, "Not Found");
+                    return Some(GitResponse::Written);
                 }
+                let mut report_len = 4 + 14 + unpack_err.len() + 4;
+                for cmd in &commands {
+                    report_len += 4 + 3 + cmd.ref_name.len() + 15;
+                }
+                if report_len <= MAX_SIDEBAND_CHUNK {
+                    let body_len = if use_sideband { 5 + report_len + 4 } else { report_len };
+                    write_git_http_header(write_buf, b"application/x-git-receive-pack-result", body_len);
+                    if use_sideband {
+                        push_hex4(write_buf, 5 + report_len);
+                        write_buf.push(0x01);
+                    }
+                    push_hex4(write_buf, 4 + 14 + unpack_err.len());
+                    write_buf.extend_from_slice(b"unpack error ");
+                    write_buf.extend_from_slice(unpack_err.as_bytes());
+                    write_buf.push(b'\n');
+                    for cmd in &commands {
+                        push_hex4(write_buf, 4 + 3 + cmd.ref_name.len() + 15);
+                        write_buf.extend_from_slice(b"ng ");
+                        write_buf.extend_from_slice(cmd.ref_name.as_bytes());
+                        write_buf.extend_from_slice(b" unpack failed\n");
+                    }
+                    write_buf.extend_from_slice(PKT_FLUSH);
+                    if use_sideband {
+                        write_buf.extend_from_slice(PKT_FLUSH);
+                    }
+                } else {
+                    let mut report = Vec::with_capacity(report_len);
+                    push_hex4(&mut report, 4 + 14 + unpack_err.len());
+                    report.extend_from_slice(b"unpack error ");
+                    report.extend_from_slice(unpack_err.as_bytes());
+                    report.push(b'\n');
+                    for cmd in &commands {
+                        push_hex4(&mut report, 4 + 3 + cmd.ref_name.len() + 15);
+                        report.extend_from_slice(b"ng ");
+                        report.extend_from_slice(cmd.ref_name.as_bytes());
+                        report.extend_from_slice(b" unpack failed\n");
+                    }
+                    report.extend_from_slice(PKT_FLUSH);
+                    let mut sb = Vec::with_capacity(report.len() + 32);
+                    if use_sideband {
+                        wrap_sideband_64k(&mut sb, &report);
+                        sb.extend_from_slice(PKT_FLUSH);
+                    } else {
+                        sb = report;
+                    }
+                    write_git_http_header(write_buf, b"application/x-git-receive-pack-result", sb.len());
+                    write_buf.extend_from_slice(&sb);
+                }
+                return Some(GitResponse::Written);
             }
             Ok(objs) => {
-                push_pkt_line(&mut report, b"unpack ok\n");
-                let outcomes = {
+                let (outcomes, updated_receive_adv) = {
                     let mut g = store.inner.write().unwrap();
+                    let Some(repo_id) = g.find_repo_id(&owner, &repo_name) else {
+                        write_json_err_into(write_buf, 404, "Not Found");
+                        return Some(GitResponse::Written);
+                    };
                     if let Some(repo) = g.repos.get_mut(&repo_id) {
                         repo.put_decoded(objs);
                     }
-                    let res = g.apply_push_commands(repo_id, &commands);
-                    if res.iter().any(|o| o.ok) {
-                        store.bump_git_epoch();
-                    }
-                    res
-                };
-                for outcome in outcomes {
-                    let mut l = Vec::with_capacity(32 + outcome.ref_name.len());
-                    if outcome.ok {
-                        l.extend_from_slice(b"ok ");
-                        l.extend_from_slice(outcome.ref_name.as_bytes());
-                        l.push(b'\n');
+                    let res = g.apply_push_commands_ref(repo_id, &commands);
+                    let adv_upd = if res.iter().any(|o| o.0) {
+                        let new_epoch = store.bump_git_epoch_val();
+                        let repo = g.repos.get_mut(&repo_id).unwrap();
+                        let adv = build_receive_v0_http(repo);
+                        repo.receive_v0_http_cache = Some(adv.clone());
+                        Some((adv, new_epoch))
                     } else {
-                        l.extend_from_slice(b"ng ");
-                        l.extend_from_slice(outcome.ref_name.as_bytes());
-                        l.push(b' ');
-                        let reason = if outcome.reason.is_empty() { "rejected" } else { outcome.reason };
-                        l.extend_from_slice(reason.as_bytes());
-                        l.push(b'\n');
+                        None
+                    };
+                    (res, adv_upd)
+                };
+
+                let mut report_len = 14 + 4; // "000eunpack ok\n" + "0000"
+                for (cmd, &(ok, reason)) in commands.iter().zip(outcomes.iter()) {
+                    if ok {
+                        report_len += 4 + 3 + cmd.ref_name.len() + 1;
+                    } else {
+                        let r = if reason.is_empty() { "rejected" } else { reason };
+                        report_len += 4 + 3 + cmd.ref_name.len() + 1 + r.len() + 1;
                     }
-                    push_pkt_line(&mut report, &l);
                 }
+                if report_len <= MAX_SIDEBAND_CHUNK {
+                    let body_len = if use_sideband { 5 + report_len + 4 } else { report_len };
+                    write_git_http_header(write_buf, b"application/x-git-receive-pack-result", body_len);
+                    if use_sideband {
+                        push_hex4(write_buf, 5 + report_len);
+                        write_buf.push(0x01);
+                    }
+                    write_buf.extend_from_slice(b"000eunpack ok\n");
+                    for (cmd, &(ok, reason)) in commands.iter().zip(outcomes.iter()) {
+                        if ok {
+                            push_hex4(write_buf, 4 + 3 + cmd.ref_name.len() + 1);
+                            write_buf.extend_from_slice(b"ok ");
+                            write_buf.extend_from_slice(cmd.ref_name.as_bytes());
+                            write_buf.push(b'\n');
+                        } else {
+                            let r = if reason.is_empty() { "rejected" } else { reason };
+                            push_hex4(write_buf, 4 + 3 + cmd.ref_name.len() + 1 + r.len() + 1);
+                            write_buf.extend_from_slice(b"ng ");
+                            write_buf.extend_from_slice(cmd.ref_name.as_bytes());
+                            write_buf.push(b' ');
+                            write_buf.extend_from_slice(r.as_bytes());
+                            write_buf.push(b'\n');
+                        }
+                    }
+                    write_buf.extend_from_slice(PKT_FLUSH);
+                    if use_sideband {
+                        write_buf.extend_from_slice(PKT_FLUSH);
+                    }
+                } else {
+                    let mut report = Vec::with_capacity(report_len);
+                    report.extend_from_slice(b"000eunpack ok\n");
+                    for (cmd, &(ok, reason)) in commands.iter().zip(outcomes.iter()) {
+                        if ok {
+                            push_hex4(&mut report, 4 + 3 + cmd.ref_name.len() + 1);
+                            report.extend_from_slice(b"ok ");
+                            report.extend_from_slice(cmd.ref_name.as_bytes());
+                            report.push(b'\n');
+                        } else {
+                            let r = if reason.is_empty() { "rejected" } else { reason };
+                            push_hex4(&mut report, 4 + 3 + cmd.ref_name.len() + 1 + r.len() + 1);
+                            report.extend_from_slice(b"ng ");
+                            report.extend_from_slice(cmd.ref_name.as_bytes());
+                            report.push(b' ');
+                            report.extend_from_slice(r.as_bytes());
+                            report.push(b'\n');
+                        }
+                    }
+                    report.extend_from_slice(PKT_FLUSH);
+                    let mut sb = Vec::with_capacity(report.len() + 32);
+                    if use_sideband {
+                        wrap_sideband_64k(&mut sb, &report);
+                        sb.extend_from_slice(PKT_FLUSH);
+                    } else {
+                        sb = report;
+                    }
+                    write_git_http_header(write_buf, b"application/x-git-receive-pack-result", sb.len());
+                    write_buf.extend_from_slice(&sb);
+                }
+                return Some(GitResponse::PushWritten { updated_receive_adv });
             }
         }
-        report.extend_from_slice(PKT_FLUSH);
-
-        let body_out = if use_sideband {
-            let mut sb = Vec::with_capacity(report.len() + 16);
-            wrap_sideband_64k(&mut sb, &report);
-            sb.extend_from_slice(PKT_FLUSH);
-            sb
-        } else {
-            report
-        };
-
-        let full = build_git_http_resp(b"application/x-git-receive-pack-result", &body_out);
-        write_buf.extend_from_slice(&full);
-        return Some(GitResponse::Written);
     }
 
     write_json_err_into(write_buf, 404, "Not Found");

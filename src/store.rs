@@ -18,6 +18,12 @@ pub const VIEWER_LOGIN: &str = "adaiversen";
 pub const VIEWER_NAME: &str = "Ada Iversen";
 pub const VIEWER_EMAIL: &str = "adaiversen@make.fun";
 
+#[inline]
+fn push_2d(dst: &mut [u8], val: i64) {
+    dst[0] = b'0' + ((val / 10) as u8);
+    dst[1] = b'0' + ((val % 10) as u8);
+}
+
 pub fn format_iso_utc(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let rem = unix_secs.rem_euclid(86_400);
@@ -37,7 +43,24 @@ pub fn format_iso_utc(unix_secs: i64) -> String {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if m <= 2 { 1 } else { 0 };
 
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+    let mut buf = [0u8; 24];
+    let yr = year.clamp(0, 9999);
+    buf[0] = b'0' + ((yr / 1000) as u8);
+    buf[1] = b'0' + (((yr / 100) % 10) as u8);
+    buf[2] = b'0' + (((yr / 10) % 10) as u8);
+    buf[3] = b'0' + ((yr % 10) as u8);
+    buf[4] = b'-';
+    push_2d(&mut buf[5..7], m);
+    buf[7] = b'-';
+    push_2d(&mut buf[8..10], d);
+    buf[10] = b'T';
+    push_2d(&mut buf[11..13], hour);
+    buf[13] = b':';
+    push_2d(&mut buf[14..16], minute);
+    buf[16] = b':';
+    push_2d(&mut buf[17..19], second);
+    buf[19..24].copy_from_slice(b".000Z");
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
 }
 
 pub fn json_escape_into(out: &mut Vec<u8>, s: &str) {
@@ -96,7 +119,7 @@ pub fn build_http_response(status_line: &[u8], content_type: &[u8], extra_header
 pub fn build_http_200_json(body: &[u8]) -> Arc<Vec<u8>> {
     Arc::new(build_http_response(
         b"HTTP/1.1 200 OK",
-        b"application/json; charset=utf-8",
+        b"application/json",
         b"",
         body,
     ))
@@ -438,7 +461,7 @@ pub struct Comment {
     pub id: u64,
     pub node_id: String,
     pub body: String,
-    pub user_login: String,
+    pub user_login: &'static str,
     pub user_id: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -453,7 +476,7 @@ pub struct Issue {
     pub body: String,
     pub is_open: bool,
     pub labels: Vec<Label>,
-    pub user_login: String,
+    pub user_login: &'static str,
     pub user_id: u64,
     pub created_seq: u64,
     pub created_at: String,
@@ -552,7 +575,7 @@ pub struct Pull {
     pub merged: bool,
     pub merged_at: Option<String>,
     pub merge_commit_sha: Option<[u8; 20]>,
-    pub user_login: String,
+    pub user_login: &'static str,
     pub user_id: u64,
     pub created_seq: u64,
     pub created_at: String,
@@ -985,16 +1008,10 @@ pub struct DirContentEntry {
     pub size: usize,
 }
 
-pub struct PushCommand {
+pub struct PushCommandRef<'a> {
     pub old_oid: [u8; 20],
     pub new_oid: [u8; 20],
-    pub ref_name: String,
-}
-
-pub struct PushOutcome {
-    pub ref_name: String,
-    pub ok: bool,
-    pub reason: &'static str,
+    pub ref_name: &'a str,
 }
 
 pub struct StoreInner {
@@ -1168,32 +1185,35 @@ impl StoreInner {
         label_names: Option<&[String]>,
     ) -> Result<u64, (u16, String)> {
         let mut resolved_labels = Vec::new();
-        {
+        if let Some(names) = label_names {
             let repo = self
                 .repos
                 .get(&repo_id)
                 .ok_or_else(|| (404u16, "Not Found".to_string()))?;
-            if let Some(names) = label_names {
-                resolved_labels.reserve(names.len());
-                for name in names {
-                    match repo.labels.get(name) {
-                        Some(lbl) => resolved_labels.push(lbl.clone()),
-                        None => {
-                            return Err((
-                                422,
-                                format!("Validation Failed: unknown label {name}"),
-                            ))
-                        }
+            resolved_labels.reserve(names.len());
+            for name in names {
+                match repo.labels.get(name) {
+                    Some(lbl) => resolved_labels.push(lbl.clone()),
+                    None => {
+                        return Err((
+                            422,
+                            format!("Validation Failed: unknown label {name}"),
+                        ))
                     }
                 }
             }
         }
         let (seq, iso, _) = self.next_stamp();
         let id = self.alloc_id();
-        let repo = self.repos.get_mut(&repo_id).unwrap();
+        let Some(repo) = self.repos.get_mut(&repo_id) else {
+            return Err((404, "Not Found".to_string()));
+        };
         let number = repo.next_number;
         repo.next_number += 1;
-        let node_id = format!("I_{id}");
+        let mut ibuf = itoa::Buffer::new();
+        let mut node_id = String::with_capacity(12);
+        node_id.push_str("I_");
+        node_id.push_str(ibuf.format(id));
         let issue = Issue {
             id,
             node_id: node_id.clone(),
@@ -1202,7 +1222,7 @@ impl StoreInner {
             body: body.to_string(),
             is_open: true,
             labels: resolved_labels,
-            user_login: VIEWER_LOGIN.to_string(),
+            user_login: VIEWER_LOGIN,
             user_id: VIEWER_ID,
             created_seq: seq,
             created_at: iso.clone(),
@@ -1259,7 +1279,7 @@ impl StoreInner {
             id,
             node_id: node_id.clone(),
             body: body.to_string(),
-            user_login: VIEWER_LOGIN.to_string(),
+            user_login: VIEWER_LOGIN,
             user_id: VIEWER_ID,
             created_at: iso.clone(),
             updated_at: iso,
@@ -1333,7 +1353,7 @@ impl StoreInner {
             merged: false,
             merged_at: None,
             merge_commit_sha: None,
-            user_login: VIEWER_LOGIN.to_string(),
+            user_login: VIEWER_LOGIN,
             user_id: VIEWER_ID,
             created_seq: seq,
             created_at: iso.clone(),
@@ -1397,7 +1417,11 @@ impl StoreInner {
         Ok(merge_sha)
     }
 
-    pub fn apply_push_commands(&mut self, repo_id: u64, commands: &[PushCommand]) -> Vec<PushOutcome> {
+    pub fn apply_push_commands_ref(
+        &mut self,
+        repo_id: u64,
+        commands: &[PushCommandRef<'_>],
+    ) -> Vec<(bool, &'static str)> {
         let Some(repo) = self.repos.get_mut(&repo_id) else {
             return Vec::new();
         };
@@ -1405,79 +1429,51 @@ impl StoreInner {
         let mut mutated = false;
 
         for cmd in commands {
-            let current_oid = repo.refs.get(&cmd.ref_name).copied().unwrap_or(ZERO_OID);
+            let current_oid = repo.refs.get(cmd.ref_name).copied().unwrap_or(ZERO_OID);
             if cmd.new_oid == ZERO_OID {
                 if current_oid == ZERO_OID || (cmd.old_oid != ZERO_OID && current_oid != cmd.old_oid) {
-                    results.push(PushOutcome {
-                        ref_name: cmd.ref_name.clone(),
-                        ok: false,
-                        reason: "stale old oid",
-                    });
+                    results.push((false, "stale old oid"));
                     continue;
                 }
-                repo.refs.remove(&cmd.ref_name);
+                repo.refs.remove(cmd.ref_name);
                 mutated = true;
-                results.push(PushOutcome {
-                    ref_name: cmd.ref_name.clone(),
-                    ok: true,
-                    reason: "",
-                });
+                results.push((true, ""));
                 continue;
             }
 
             let Some(target_kind) = repo.objects.get(&cmd.new_oid).map(|o| o.kind) else {
-                results.push(PushOutcome {
-                    ref_name: cmd.ref_name.clone(),
-                    ok: false,
-                    reason: "missing object",
-                });
+                results.push((false, "missing object"));
                 continue;
             };
 
             if current_oid == ZERO_OID {
                 if cmd.old_oid != ZERO_OID {
-                    results.push(PushOutcome {
-                        ref_name: cmd.ref_name.clone(),
-                        ok: false,
-                        reason: "non-fast-forward",
-                    });
+                    results.push((false, "non-fast-forward"));
                     continue;
                 }
-                repo.refs.insert(cmd.ref_name.clone(), cmd.new_oid);
+                repo.refs.insert(cmd.ref_name.to_string(), cmd.new_oid);
                 mutated = true;
-                results.push(PushOutcome {
-                    ref_name: cmd.ref_name.clone(),
-                    ok: true,
-                    reason: "",
-                });
+                results.push((true, ""));
                 continue;
             }
 
             if cmd.old_oid != ZERO_OID && cmd.old_oid != current_oid {
-                results.push(PushOutcome {
-                    ref_name: cmd.ref_name.clone(),
-                    ok: false,
-                    reason: "non-fast-forward",
-                });
+                results.push((false, "non-fast-forward"));
                 continue;
             }
 
             if target_kind == ObjKind::Commit && !repo.is_ancestor(&current_oid, &cmd.new_oid) {
-                results.push(PushOutcome {
-                    ref_name: cmd.ref_name.clone(),
-                    ok: false,
-                    reason: "non-fast-forward",
-                });
+                results.push((false, "non-fast-forward"));
                 continue;
             }
 
-            repo.refs.insert(cmd.ref_name.clone(), cmd.new_oid);
+            if let Some(slot) = repo.refs.get_mut(cmd.ref_name) {
+                *slot = cmd.new_oid;
+            } else {
+                repo.refs.insert(cmd.ref_name.to_string(), cmd.new_oid);
+            }
             mutated = true;
-            results.push(PushOutcome {
-                ref_name: cmd.ref_name.clone(),
-                ok: true,
-                reason: "",
-            });
+            results.push((true, ""));
         }
 
         if mutated {
@@ -1732,5 +1728,10 @@ impl ForgeStore {
     #[inline]
     pub fn bump_git_epoch(&self) {
         self.git_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn bump_git_epoch_val(&self) -> u64 {
+        self.git_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
