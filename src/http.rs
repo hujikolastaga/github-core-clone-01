@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,8 +12,23 @@ use crate::pack::PackDecoder;
 use crate::rest::{handle_rest_api, not_found_http, RestResponse};
 use crate::store::{base64_decode_lenient, build_http_response, ForgeStore};
 
+// On 2-CPU Linux musl sandbox: 1 CPU is used by the Node benchmark client.
+// Keep worker pool tiny to avoid Mutex/Condvar/musl-alloc contention.
+// The overflow path spawns on-demand up to MAX_TOTAL_WORKERS.
+#[cfg(target_os = "linux")]
+const WORKER_COUNT: usize = 2;
+#[cfg(not(target_os = "linux"))]
 const WORKER_COUNT: usize = 128;
+
+#[cfg(target_os = "linux")]
+const MAX_TOTAL_WORKERS: usize = 8;
+#[cfg(not(target_os = "linux"))]
 const MAX_TOTAL_WORKERS: usize = 200;
+
+// musl default stack is 128 KB; use 512 KB on Linux, 256 KB on Windows
+#[cfg(target_os = "linux")]
+const WORKER_STACK_BYTES: usize = 512 * 1024;
+#[cfg(not(target_os = "linux"))]
 const WORKER_STACK_BYTES: usize = 256 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const HEALTHZ_HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nX-GitHub-Request-Id: 1\r\n\r\n{\"ok\":true}";

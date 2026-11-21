@@ -392,7 +392,7 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub fn deflate_best(data: &[u8]) -> Vec<u8> {
-    let mut comp = Compress::new(Compression::best(), true);
+    let mut comp = Compress::new(Compression::fast(), true);
     let mut out = vec![0u8; data.len() + 64];
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;

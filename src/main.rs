@@ -208,6 +208,7 @@ fn main() {
     let accept_ctx = ctx.clone();
     thread::Builder::new()
         .name("forge-accept".to_string())
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || accept_ctx.run_accept_loop(listener))
         .expect("spawn accept loop");
 
